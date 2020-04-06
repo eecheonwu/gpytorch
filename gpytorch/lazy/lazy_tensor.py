@@ -3,6 +3,7 @@
 import math
 import warnings
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
 
@@ -20,6 +21,7 @@ from ..utils.deprecation import _deprecate_renamed_methods
 from ..utils.getitem import _compute_getitem_size, _convert_indices_to_tensors, _noop_index
 from ..utils.gradients import _ensure_symmetric_grad
 from ..utils.memoize import add_to_cache, cached
+from ..utils.pivoted_cholesky import pivoted_cholesky
 from .lazy_tensor_representation_tree import LazyTensorRepresentationTree
 
 
@@ -1306,7 +1308,7 @@ class LazyTensor(ABC):
         return self
 
     @cached(name="root_decomposition")
-    def root_decomposition(self):
+    def root_decomposition(self, method: Optional[str] = None):
         """
         Returns a (usually low-rank) root decomposition lazy tensor of a PSD matrix.
         This can be used for sampling from a Gaussian distribution, or for obtaining a
@@ -1321,21 +1323,44 @@ class LazyTensor(ABC):
                 "Got a {} of size {}.".format(self.__class__.__name__, self.size())
             )
 
-        if (
-            self.size(-1) <= settings.max_cholesky_size.value()
-            or settings.fast_computations.covar_root_decomposition.off()
-        ):
+        if method is None:
+            if (
+                self.size(-1) <= settings.max_cholesky_size.value()
+                or settings.fast_computations.covar_root_decomposition.off()
+            ):
+                method = "cholesky"
+            else:
+                method = "lanczos"
+
+        if method == "cholesky":
             try:
                 res = self.cholesky()
                 return CholLazyTensor(res)
-
             except RuntimeError as e:
-                warnings.warn(
-                    "Runtime Error when computing Cholesky decomposition: {}. Using RootDecomposition.".format(e)
-                )
+                warnings.warn(f"Runtime Error when computing Cholesky decomposition: {e}. Using eigendecomposition.")
+                method = "symeig"
 
-        res = self._root_decomposition()
-        return RootLazyTensor(res)
+        if method == "pivoted_cholesky":
+            return RootLazyTensor(pivoted_cholesky(self.evaluate(), max_iter=100))
+
+        if method == "symeig":
+            # TODO: Allow Lazy Tensors to implement their own symeig method
+            evals, evecs = torch.symeig(self.evaluate(), eigenvectors=True)
+            # TODO: only use non-zero evals (req. dealing w/ batches...)
+            F = evecs * evals.clamp(0.0).sqrt().unsqueeze(-2)
+            return RootLazyTensor(F)
+
+        if method == "svd":
+            # TODO: Allow Lazy Tensors to implement their own SVD method
+            U, S, _ = torch.svd(self.evaluate())
+            # TODO: only use non-zero singular values (req. dealing w/ batches...)
+            F = U * S.sqrt().unsqueeze(-2)
+            return RootLazyTensor(F)
+
+        if method == "lanczos":
+            return RootLazyTensor(self._root_decomposition())
+
+        raise RuntimeError(f"Unknown method '{method}'")
 
     @cached(name="root_inv_decomposition")
     def root_inv_decomposition(self, initial_vectors=None, test_vectors=None):
